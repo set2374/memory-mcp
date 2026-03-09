@@ -1,0 +1,25 @@
+[project]
+name = "memory-mcp-server"
+version = "1.0.0"
+description = "Local-only MCP memory server for Claude Code — SQLite-backed persistent memory across sessions"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.8.0",
+    "loguru>=0.7.3",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

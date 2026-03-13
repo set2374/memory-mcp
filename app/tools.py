@@ -1,4 +1,8 @@
-"""MCP tool implementations for Memory Server."""
+"""MCP tool implementations for Memory Server.
+
+Write path: build canonical event → store_event() → also insert into SQLite cache.
+Read path: read from SQLite cache (populated from canonical events).
+"""
 
 import json
 import os
@@ -7,7 +11,23 @@ from datetime import datetime, timezone
 
 from loguru import logger
 
-from app.db import db_size_kb, get_connection
+from app.canonical import (
+    build_event,
+    canonical_available,
+    outbox_count,
+    store_event,
+)
+from app.config import config
+from app.db import (
+    cache_close_loop,
+    cache_insert_handoff,
+    cache_insert_loop,
+    cache_insert_memory,
+    db_size_kb,
+    get_connection,
+    rebuild_cache_from_canonical,
+)
+from app.identity import resolve_project_id
 
 
 def _now() -> str:
@@ -28,6 +48,15 @@ def _rows_to_list(rows) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _memory_type_to_event_type(memory_type: str) -> str:
+    """Map Claude memory_type to canonical event_type."""
+    if memory_type == "architecture_decision":
+        return "decision_recorded"
+    if memory_type == "project_context":
+        return "project_context_updated"
+    return "fact"
+
+
 # ---------------------------------------------------------------------------
 # Tool 1: memory_status
 # ---------------------------------------------------------------------------
@@ -36,7 +65,6 @@ def memory_status() -> dict:
     """Check memory server health, database size, and memory counts by type."""
     conn = get_connection()
     try:
-        # Counts by type
         rows = conn.execute(
             "SELECT memory_type, COUNT(*) as cnt FROM memories "
             "WHERE is_archived = 0 GROUP BY memory_type"
@@ -44,27 +72,41 @@ def memory_status() -> dict:
         by_type = {r["memory_type"]: r["cnt"] for r in rows}
         total = sum(by_type.values())
 
-        # Open loops
         open_loops = conn.execute(
             "SELECT COUNT(*) as cnt FROM open_loops WHERE status = 'open'"
         ).fetchone()["cnt"]
 
-        # Total handoffs
         total_handoffs = conn.execute(
             "SELECT COUNT(*) as cnt FROM handoffs"
         ).fetchone()["cnt"]
 
-        # Last handoff
         last = conn.execute(
             "SELECT id, session_id, summary, created_at FROM handoffs "
             "ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
 
+        # Sync metadata
+        last_rebuild = None
+        try:
+            row = conn.execute(
+                "SELECT value FROM sync_meta WHERE key = 'last_rebuild'"
+            ).fetchone()
+            if row:
+                last_rebuild = row["value"]
+        except Exception:
+            pass
+
         return {
             "status": "healthy",
-            "version": "1.0.0",
-            "db_path": str(get_connection().execute("PRAGMA database_list").fetchone()[2]),
-            "db_size_kb": db_size_kb(),
+            "version": "2.0.0",
+            "machine_id": config.machine_id,
+            "memory_enabled": config.memory_enabled,
+            "canonical_root": str(config.canonical_root),
+            "canonical_available": canonical_available(),
+            "cache_db_path": str(config.db_path),
+            "cache_db_size_kb": db_size_kb(),
+            "outbox_count": outbox_count(),
+            "last_cache_rebuild": last_rebuild,
             "counts": {
                 "total_memories": total,
                 "by_type": by_type,
@@ -78,7 +120,7 @@ def memory_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Tool 2: memory_read_recent
+# Tool 2: memory_read_recent (reads from cache)
 # ---------------------------------------------------------------------------
 
 def memory_read_recent(
@@ -87,14 +129,6 @@ def memory_read_recent(
     limit: int = 20,
     include_archived: bool = False,
 ) -> dict:
-    """Read recent memories, optionally filtered by type and/or project scope.
-
-    Args:
-        memory_type: Filter by type (preference, architecture_decision, project_context, correction, instruction, observation, handoff).
-        project_path: NULL returns global-only, "*" returns all, specific path returns project-scoped + global.
-        limit: Max results (default 20, max 100).
-        include_archived: Include archived/superseded memories.
-    """
     limit = min(limit, 100)
     conn = get_connection()
     try:
@@ -120,7 +154,6 @@ def memory_read_recent(
 
         rows = conn.execute(sql, params).fetchall()
 
-        # Count total matching
         count_sql = f"SELECT COUNT(*) as cnt FROM memories WHERE {where}"
         total = conn.execute(count_sql, params[:-1]).fetchone()["cnt"]
 
@@ -134,7 +167,7 @@ def memory_read_recent(
 
 
 # ---------------------------------------------------------------------------
-# Tool 3: memory_search
+# Tool 3: memory_search (reads from cache FTS5)
 # ---------------------------------------------------------------------------
 
 def memory_search(
@@ -144,19 +177,9 @@ def memory_search(
     tags: str | None = None,
     limit: int = 10,
 ) -> dict:
-    """Full-text search across all memories using SQLite FTS5.
-
-    Args:
-        query: FTS5 query (supports AND, OR, NOT, "phrase", prefix*).
-        memory_type: Filter by type.
-        project_path: Scope filter.
-        tags: JSON array of tags to filter by.
-        limit: Max results (default 10, max 50).
-    """
     limit = min(limit, 50)
     conn = get_connection()
     try:
-        # Build join query: FTS match + filters on main table
         conditions = ["m.is_archived = 0"]
         params: list = [query]
 
@@ -191,7 +214,6 @@ def memory_search(
 
         rows = conn.execute(sql, params).fetchall()
 
-        # Update accessed_at for returned results
         ids = [r["id"] for r in rows]
         if ids:
             placeholders = ",".join("?" * len(ids))
@@ -211,7 +233,7 @@ def memory_search(
 
 
 # ---------------------------------------------------------------------------
-# Tool 4: memory_write_fact
+# Tool 4: memory_write_fact (dual-write: canonical + cache)
 # ---------------------------------------------------------------------------
 
 def memory_write_fact(
@@ -226,65 +248,79 @@ def memory_write_fact(
     supersedes_id: str | None = None,
     session_id: str | None = None,
 ) -> dict:
-    """Store a new memory (preference, decision, correction, observation, etc.).
+    if not config.memory_enabled:
+        return {"error": "Memory is disabled", "memory_enabled": False}
 
-    Args:
-        memory_type: Required — preference, architecture_decision, project_context, correction, instruction, observation, handoff.
-        content: The memory text.
-        summary: Optional short summary for search results.
-        project_path: NULL = global.
-        matter_name: Optional legal matter name.
-        tags: JSON array of string tags.
-        confidence: high, medium, or low.
-        source: Origin — user, session, hook, migration.
-        supersedes_id: ID of memory this replaces (old one gets archived).
-        session_id: Session that created this.
-    """
-    new_id = _gen_id()
-    now = _now()
+    tag_list = json.loads(tags) if isinstance(tags, str) else tags
+    event_type = _memory_type_to_event_type(memory_type)
+    project_id = resolve_project_id(project_path)
+    scope = "project" if project_path else "global"
+
+    # Build dedupe key from content hash for exact-duplicate prevention
+    dedupe_key = f"{memory_type}:{content[:100]}" if content else None
+
+    # Build canonical event
+    event = build_event(
+        event_type=event_type,
+        kind=memory_type,
+        subject=summary or content[:80],
+        summary=content,
+        scope=scope,
+        project_id=project_id,
+        details={
+            "source": source,
+            "confidence": confidence,
+            "project_path": project_path,
+            "matter_name": matter_name,
+            "session_id": session_id,
+            "supersedes_id": supersedes_id,
+        },
+        tags=tag_list,
+        dedupe_key=dedupe_key,
+    )
+
+    # Write to canonical store (or outbox)
+    result = store_event(event)
+    if result.get("error") or result.get("skipped"):
+        return result
+
+    # Also insert into SQLite cache
+    new_id = event["event_id"]
     conn = get_connection()
     try:
-        superseded_info = None
-
-        # Archive the old memory if superseding
-        if supersedes_id:
-            old = conn.execute(
-                "SELECT id, content FROM memories WHERE id = ?", (supersedes_id,)
-            ).fetchone()
-            if old:
-                conn.execute(
-                    "UPDATE memories SET is_archived = 1, updated_at = ? WHERE id = ?",
-                    (now, supersedes_id),
-                )
-                superseded_info = _row_to_dict(old)
-
-        conn.execute(
-            """INSERT INTO memories
-            (id, memory_type, content, summary, source, project_path, matter_name,
-             tags, confidence, created_at, updated_at, session_id, supersedes_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                new_id, memory_type, content, summary, source,
-                project_path, matter_name, tags, confidence,
-                now, now, session_id, supersedes_id,
-            ),
+        cache_insert_memory(
+            conn,
+            id=new_id,
+            event_id=new_id,
+            memory_type=memory_type,
+            content=content,
+            summary=summary,
+            source=source,
+            project_path=project_path,
+            matter_name=matter_name,
+            tags=tags,
+            confidence=confidence,
+            created_at=event["created_at"],
+            session_id=session_id,
+            supersedes_id=supersedes_id,
         )
         conn.commit()
-
-        logger.info(f"Stored memory {new_id} type={memory_type}")
-        return {
-            "id": new_id,
-            "memory_type": memory_type,
-            "content": content,
-            "created_at": now,
-            "superseded": superseded_info,
-        }
     finally:
         conn.close()
 
+    logger.info(f"Stored memory {new_id} type={memory_type}")
+    return {
+        "id": new_id,
+        "event_id": new_id,
+        "memory_type": memory_type,
+        "content": content,
+        "created_at": event["created_at"],
+        "canonical": not result.get("_queued", False),
+    }
+
 
 # ---------------------------------------------------------------------------
-# Tool 5: memory_write_handoff
+# Tool 5: memory_write_handoff (dual-write: canonical + cache)
 # ---------------------------------------------------------------------------
 
 def memory_write_handoff(
@@ -297,47 +333,123 @@ def memory_write_handoff(
     project_path: str | None = None,
     matter_name: str | None = None,
 ) -> dict:
-    """Record a session handoff for continuity between sessions.
+    if not config.memory_enabled:
+        return {"error": "Memory is disabled", "memory_enabled": False}
 
-    Args:
-        session_id: The session creating this handoff.
-        summary: What was accomplished this session.
-        decisions: JSON array of decisions made.
-        open_items: JSON array of unfinished work.
-        next_steps: JSON array of recommended next actions.
-        context_notes: Anything the next session needs to know.
-        project_path: Scope to a project.
-        matter_name: Optional matter name.
-    """
-    new_id = _gen_id()
-    now = _now()
+    project_id = resolve_project_id(project_path)
+    scope = "project" if project_path else "global"
+
+    decisions_list = json.loads(decisions) if isinstance(decisions, str) else decisions
+    open_items_list = json.loads(open_items) if isinstance(open_items, str) else open_items
+    next_steps_list = json.loads(next_steps) if isinstance(next_steps, str) else next_steps
+
+    # Build handoff event
+    event = build_event(
+        event_type="handoff",
+        kind="session_handoff",
+        subject=f"handoff-{session_id}",
+        summary=summary,
+        scope=scope,
+        project_id=project_id,
+        details={
+            "session_id": session_id,
+            "decisions": decisions_list,
+            "open_items": open_items_list,
+            "next_steps": next_steps_list,
+            "context_notes": context_notes,
+            "project_path": project_path,
+            "matter_name": matter_name,
+        },
+        tags=["handoff"],
+    )
+
+    result = store_event(event)
+    if result.get("error") or result.get("skipped"):
+        return result
+
+    # Insert into cache
+    new_id = event["event_id"]
     conn = get_connection()
     try:
-        conn.execute(
-            """INSERT INTO handoffs
-            (id, session_id, summary, decisions, open_items, next_steps,
-             context_notes, project_path, matter_name, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                new_id, session_id, summary, decisions, open_items,
-                next_steps, context_notes, project_path, matter_name, now,
-            ),
+        cache_insert_handoff(
+            conn,
+            id=new_id,
+            event_id=new_id,
+            session_id=session_id,
+            summary=summary,
+            decisions=decisions,
+            open_items=open_items,
+            next_steps=next_steps,
+            context_notes=context_notes,
+            project_path=project_path,
+            matter_name=matter_name,
+            created_at=event["created_at"],
         )
         conn.commit()
 
-        logger.info(f"Stored handoff {new_id} for session {session_id}")
-        return {
-            "id": new_id,
-            "session_id": session_id,
-            "summary": summary,
-            "created_at": now,
-        }
+        # Emit decision_recorded events for each decision (spec §6.5)
+        for decision in decisions_list:
+            dec_text = decision if isinstance(decision, str) else json.dumps(decision)
+            dec_event = build_event(
+                event_type="decision_recorded",
+                kind="architecture_decision",
+                subject=dec_text[:80],
+                summary=dec_text,
+                scope=scope,
+                project_id=project_id,
+                tags=["handoff", "decision"],
+            )
+            store_event(dec_event)
+
+        # Emit loop_opened events for each open item (spec §6.5)
+        for item in open_items_list:
+            item_text = item if isinstance(item, str) else json.dumps(item)
+            loop_event = build_event(
+                event_type="loop_opened",
+                kind="task",
+                subject=item_text[:80],
+                summary=item_text,
+                scope=scope,
+                project_id=project_id,
+                details={
+                    "loop_type": "task",
+                    "priority": "normal",
+                    "project_path": project_path,
+                    "session_id": session_id,
+                },
+                tags=["handoff", "open-item"],
+            )
+            loop_result = store_event(loop_event)
+            if not loop_result.get("error") and not loop_result.get("skipped"):
+                cache_insert_loop(
+                    conn,
+                    id=loop_event["event_id"],
+                    event_id=loop_event["event_id"],
+                    canonical_subject=loop_event.get("subject", item_text[:80]),
+                    description=item_text,
+                    loop_type="task",
+                    project_path=project_path,
+                    priority="normal",
+                    created_at=loop_event["created_at"],
+                    session_id=session_id,
+                )
+        conn.commit()
     finally:
         conn.close()
 
+    logger.info(f"Stored handoff {new_id} for session {session_id}")
+    return {
+        "id": new_id,
+        "event_id": new_id,
+        "session_id": session_id,
+        "summary": summary,
+        "created_at": event["created_at"],
+        "canonical": not result.get("_queued", False),
+    }
+
 
 # ---------------------------------------------------------------------------
-# Tool 6: memory_get_open_loops
+# Tool 6: memory_get_open_loops (reads from cache)
 # ---------------------------------------------------------------------------
 
 def memory_get_open_loops(
@@ -347,15 +459,6 @@ def memory_get_open_loops(
     include_closed: bool = False,
     limit: int = 20,
 ) -> dict:
-    """Retrieve open loops (unfinished tasks, unresolved questions, follow-ups, blockers).
-
-    Args:
-        project_path: NULL = global only, "*" = all.
-        loop_type: Filter by type (task, question, follow_up, blocker).
-        priority: Filter by priority (high, normal, low).
-        include_closed: Include closed loops.
-        limit: Max results (default 20).
-    """
     limit = min(limit, 100)
     conn = get_connection()
     try:
@@ -385,7 +488,6 @@ def memory_get_open_loops(
         sql = f"SELECT * FROM open_loops WHERE {where} ORDER BY created_at DESC LIMIT ?"
         rows = conn.execute(sql, params).fetchall()
 
-        # Total open count (unfiltered)
         total_open = conn.execute(
             "SELECT COUNT(*) as cnt FROM open_loops WHERE status = 'open'"
         ).fetchone()["cnt"]
@@ -399,7 +501,7 @@ def memory_get_open_loops(
 
 
 # ---------------------------------------------------------------------------
-# Tool 7: memory_create_loop
+# Tool 7: memory_create_loop (dual-write: canonical + cache)
 # ---------------------------------------------------------------------------
 
 def memory_create_loop(
@@ -411,105 +513,153 @@ def memory_create_loop(
     tags: str = "[]",
     session_id: str | None = None,
 ) -> dict:
-    """Create a new open loop (task, question, follow-up, or blocker).
+    if not config.memory_enabled:
+        return {"error": "Memory is disabled", "memory_enabled": False}
 
-    Args:
-        description: What needs to be done or resolved.
-        loop_type: task, question, follow_up, or blocker.
-        priority: high, normal, or low.
-        project_path: Scope to a project.
-        matter_name: Optional matter name.
-        tags: JSON array of tags.
-        session_id: Session creating this loop.
-    """
-    new_id = _gen_id()
-    now = _now()
+    tag_list = json.loads(tags) if isinstance(tags, str) else tags
+    project_id = resolve_project_id(project_path)
+    scope = "project" if project_path else "global"
+
+    event = build_event(
+        event_type="loop_opened",
+        kind=loop_type,
+        subject=description[:80],
+        summary=description,
+        scope=scope,
+        project_id=project_id,
+        details={
+            "loop_type": loop_type,
+            "priority": priority,
+            "project_path": project_path,
+            "matter_name": matter_name,
+            "session_id": session_id,
+        },
+        tags=tag_list + [loop_type],
+    )
+
+    result = store_event(event)
+    if result.get("error") or result.get("skipped"):
+        return result
+
+    new_id = event["event_id"]
+    canonical_subject = event.get("subject", description[:80])
     conn = get_connection()
     try:
-        conn.execute(
-            """INSERT INTO open_loops
-            (id, description, loop_type, project_path, matter_name,
-             status, priority, created_at, tags, session_id)
-            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
-            (
-                new_id, description, loop_type, project_path,
-                matter_name, priority, now, tags, session_id,
-            ),
+        cache_insert_loop(
+            conn,
+            id=new_id,
+            event_id=new_id,
+            canonical_subject=canonical_subject,
+            description=description,
+            loop_type=loop_type,
+            project_path=project_path,
+            matter_name=matter_name,
+            priority=priority,
+            tags=tags,
+            created_at=event["created_at"],
+            session_id=session_id,
         )
         conn.commit()
-
-        logger.info(f"Created loop {new_id} type={loop_type}")
-        return {
-            "id": new_id,
-            "description": description,
-            "loop_type": loop_type,
-            "status": "open",
-            "priority": priority,
-            "created_at": now,
-        }
     finally:
         conn.close()
 
+    logger.info(f"Created loop {new_id} type={loop_type}")
+    return {
+        "id": new_id,
+        "event_id": new_id,
+        "description": description,
+        "loop_type": loop_type,
+        "status": "open",
+        "priority": priority,
+        "created_at": event["created_at"],
+        "canonical": not result.get("_queued", False),
+    }
+
 
 # ---------------------------------------------------------------------------
-# Tool 8: memory_close_loop
+# Tool 8: memory_close_loop (emit loop_closed event + update cache)
 # ---------------------------------------------------------------------------
 
 def memory_close_loop(loop_id: str, resolution: str) -> dict:
-    """Close an open loop with a resolution note.
+    """Close an open loop by emitting a loop_closed event (append-only)."""
+    if not config.memory_enabled:
+        return {"error": "Memory is disabled", "memory_enabled": False}
 
-    Args:
-        loop_id: ID of the loop to close.
-        resolution: How it was resolved.
-    """
-    now = _now()
+    # Look up the loop in cache to get context
     conn = get_connection()
     try:
-        conn.execute(
-            "UPDATE open_loops SET status = 'closed', resolution = ?, closed_at = ? WHERE id = ?",
-            (resolution, now, loop_id),
-        )
-        conn.commit()
-
         row = conn.execute("SELECT * FROM open_loops WHERE id = ?", (loop_id,)).fetchone()
         if not row:
             return {"error": f"Loop {loop_id} not found"}
 
+        loop_data = _row_to_dict(row)
+        project_path = loop_data.get("project_path")
+        project_id = resolve_project_id(project_path)
+        scope = "project" if project_path else "global"
+
+        # Use the canonical subject from the loop_opened event as the loop
+        # identifier in the loop_closed event. This ensures cross-runtime
+        # compatibility — both Codex and Claude match loops by this field.
+        canonical_subj = loop_data.get("canonical_subject") or loop_id
+
+        # Build loop_closed event (spec §6.7 — new event, not mutation)
+        event = build_event(
+            event_type="loop_closed",
+            kind=loop_data.get("loop_type", "task"),
+            subject=canonical_subj,  # Must match loop_opened.subject
+            summary=resolution,
+            scope=scope,
+            project_id=project_id,
+            details={
+                "loop_id": canonical_subj,
+                "original_description": loop_data.get("description"),
+                "resolution": resolution,
+            },
+            tags=["loop-closed"],
+        )
+
+        result = store_event(event)
+        if result.get("error"):
+            return result
+
+        # Update cache (local mutation is fine — cache is not source of truth)
+        cache_close_loop(
+            conn,
+            loop_id=loop_id,
+            resolution=resolution,
+            closed_at=event["created_at"],
+            close_event_id=event["event_id"],
+        )
+        conn.commit()
+
+        # Re-fetch for return
+        updated = conn.execute("SELECT * FROM open_loops WHERE id = ?", (loop_id,)).fetchone()
         logger.info(f"Closed loop {loop_id}")
-        return _row_to_dict(row)
+        return _row_to_dict(updated)
     finally:
         conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Tool 9: memory_get_project_context
+# Tool 9: memory_get_project_context (reads from cache)
 # ---------------------------------------------------------------------------
 
 def memory_get_project_context(
     project_path: str,
     include_global: bool = True,
 ) -> dict:
-    """Get all memories scoped to a project plus global, as a structured continuity brief.
-
-    Args:
-        project_path: The project directory path.
-        include_global: Include global (unscoped) memories.
-    """
     conn = get_connection()
     try:
-        # Latest handoff for this project
         handoff = conn.execute(
             "SELECT * FROM handoffs WHERE project_path = ? ORDER BY created_at DESC LIMIT 1",
             (project_path,),
         ).fetchone()
 
-        # Also check global handoff if no project-specific one
         if not handoff and include_global:
             handoff = conn.execute(
                 "SELECT * FROM handoffs WHERE project_path IS NULL ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
 
-        # Open loops for this project + global
         if include_global:
             loops = conn.execute(
                 "SELECT * FROM open_loops WHERE status = 'open' "
@@ -524,7 +674,6 @@ def memory_get_project_context(
                 (project_path,),
             ).fetchall()
 
-        # Recent memories for this project
         if include_global:
             memories = conn.execute(
                 "SELECT * FROM memories WHERE is_archived = 0 "
@@ -539,7 +688,6 @@ def memory_get_project_context(
                 (project_path,),
             ).fetchall()
 
-        # Global preferences (always useful)
         prefs = []
         if include_global:
             prefs = conn.execute(
@@ -548,7 +696,6 @@ def memory_get_project_context(
                 "ORDER BY updated_at DESC LIMIT 10"
             ).fetchall()
 
-        # Counts
         proj_mem = conn.execute(
             "SELECT COUNT(*) as cnt FROM memories WHERE is_archived = 0 AND project_path = ?",
             (project_path,),
@@ -584,7 +731,6 @@ def memory_get_project_context(
 # Tool 10: memory_import_markdown
 # ---------------------------------------------------------------------------
 
-# Heading-to-type mapping for markdown import
 _HEADING_TYPE_MAP = {
     "preferences": "preference",
     "preference": "preference",
@@ -612,17 +758,6 @@ def memory_import_markdown(
     project_path: str | None = None,
     dry_run: bool = False,
 ) -> dict:
-    """Import existing markdown memory files (MEMORY.md, checkpoint.md) into the database.
-
-    Parses bullet-point entries under headings. Idempotent — skips entries whose
-    content already exists in the database.
-
-    Args:
-        file_path: Absolute path to the .md file.
-        default_type: Default memory_type for entries without a recognized heading.
-        project_path: Scope all imported entries to this project.
-        dry_run: If true, parse but do not write.
-    """
     from pathlib import Path
 
     path = Path(file_path)
@@ -634,18 +769,14 @@ def memory_import_markdown(
 
     entries: list[dict] = []
     current_type = default_type
-    current_heading = ""
 
     for line in lines:
-        # Detect headings
         heading_match = re.match(r"^#{1,3}\s+(.+)$", line)
         if heading_match:
             heading_text = heading_match.group(1).strip().lower()
-            current_heading = heading_text
             current_type = _HEADING_TYPE_MAP.get(heading_text, default_type)
             continue
 
-        # Detect bullet points
         bullet_match = re.match(r"^\s*[-*]\s+\*\*(.+?)\*\*[:\s]*(.*)", line)
         if not bullet_match:
             bullet_match = re.match(r"^\s*[-*]\s+(.+)", line)
@@ -655,14 +786,12 @@ def memory_import_markdown(
             if len(content) < 5:
                 continue
 
-            # Try to extract date from content
             date_match = re.search(r"\((\d{4}-\d{2}-\d{2})\)", content)
             created_at = date_match.group(1) + "T00:00:00Z" if date_match else _now()
 
             entries.append({
                 "content": content,
                 "memory_type": current_type,
-                "heading": current_heading,
                 "created_at": created_at,
             })
 
@@ -673,15 +802,15 @@ def memory_import_markdown(
             "entries_imported": 0,
             "entries_skipped": 0,
             "dry_run": True,
-            "entries": entries[:50],  # Cap preview
+            "entries": entries[:50],
         }
 
-    conn = get_connection()
     imported = 0
     skipped = 0
+    conn = get_connection()
     try:
         for entry in entries:
-            # Check for duplicate content
+            # Check for duplicate in cache
             exists = conn.execute(
                 "SELECT id FROM memories WHERE content = ? AND is_archived = 0",
                 (entry["content"],),
@@ -692,24 +821,23 @@ def memory_import_markdown(
                 entry["imported"] = False
                 continue
 
-            new_id = _gen_id()
-            conn.execute(
-                """INSERT INTO memories
-                (id, memory_type, content, source, project_path,
-                 created_at, updated_at, tags)
-                VALUES (?, ?, ?, 'migration', ?, ?, ?, '[]')""",
-                (
-                    new_id, entry["memory_type"], entry["content"],
-                    project_path, entry["created_at"], _now(),
-                ),
+            # Write as canonical event + cache
+            result = memory_write_fact(
+                memory_type=entry["memory_type"],
+                content=entry["content"],
+                source="migration",
+                project_path=project_path,
             )
-            imported += 1
-            entry["imported"] = True
-            entry["id"] = new_id
 
-        conn.commit()
+            if result.get("error"):
+                skipped += 1
+                entry["imported"] = False
+            else:
+                imported += 1
+                entry["imported"] = True
+                entry["id"] = result.get("id")
+
         logger.info(f"Imported {imported} entries from {file_path} (skipped {skipped})")
-
         return {
             "file_path": file_path,
             "entries_found": len(entries),
@@ -722,23 +850,14 @@ def memory_import_markdown(
 
 
 # ---------------------------------------------------------------------------
-# Tool 11: memory_read_codex — read-only access to Codex's memory cache
+# Tool 11: memory_read_codex (compatibility bridge — reads Codex's local cache)
 # ---------------------------------------------------------------------------
 
 def _find_codex_cache_db() -> str | None:
-    """Locate the Codex memory-cache SQLite database.
-
-    Codex stores its memory cache at:
-        ~/.codex/memory-cache/<machine_id>/cache.sqlite
-
-    Returns the first cache.sqlite found, or None.
-    """
     from pathlib import Path
-
     cache_root = Path.home() / ".codex" / "memory-cache"
     if not cache_root.exists():
         return None
-
     for machine_dir in cache_root.iterdir():
         db_path = machine_dir / "cache.sqlite"
         if db_path.exists():
@@ -747,11 +866,9 @@ def _find_codex_cache_db() -> str | None:
 
 
 def _codex_row_to_dict(row) -> dict:
-    """Convert a Codex cache SQLite row to a clean dict."""
     if row is None:
         return {}
     d = dict(row)
-    # Parse JSON fields
     for json_field, target in [("details_json", "details"), ("tags_json", "tags")]:
         if json_field in d:
             try:
@@ -768,18 +885,10 @@ def memory_read_codex(
     project_id: str | None = None,
     limit: int = 20,
 ) -> dict:
-    """Read memories from Codex's local memory cache (read-only cross-environment bridge).
+    """Read from Codex's local memory cache (compatibility bridge).
 
-    Provides read access to events stored by the Codex memory MCP server,
-    enabling cross-environment memory continuity between Claude Code and Codex.
-
-    Args:
-        query: FTS5 search query (if None, returns recent events).
-        event_type: Filter by type (fact, handoff, loop_opened, loop_closed,
-                    project_context_updated, decision_recorded).
-        scope: 'global', 'project', or 'all' (default 'all').
-        project_id: Filter by project ID (used with scope='project' or 'all').
-        limit: Max results (default 20, max 50).
+    NOTE: Once both agents use the same canonical store, this tool becomes
+    redundant. Both read from the same canonical events via the shared cache.
     """
     import sqlite3 as _sqlite3
 
@@ -788,7 +897,7 @@ def memory_read_codex(
     if not db_path:
         return {
             "error": "Codex memory cache not found at ~/.codex/memory-cache/",
-            "hint": "Ensure the codex-memory-mcp server has been run at least once.",
+            "hint": "Both agents now share the canonical store. Use memory_search instead.",
             "results": [],
             "total_matches": 0,
         }
@@ -796,7 +905,6 @@ def memory_read_codex(
     conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = _sqlite3.Row
     try:
-        # Check if FTS is available
         fts_enabled = False
         try:
             row = conn.execute(
@@ -807,14 +915,11 @@ def memory_read_codex(
             pass
 
         if query and fts_enabled:
-            # FTS search
             clauses = ["events_fts MATCH ?"]
             params: list = [query]
-
             if event_type:
                 clauses.append("e.event_type = ?")
                 params.append(event_type)
-
             if scope == "global":
                 clauses.append("e.scope = 'global'")
             elif scope == "project":
@@ -823,33 +928,24 @@ def memory_read_codex(
                     clauses.append("e.project_id = ?")
                     params.append(project_id)
             elif scope == "all" and project_id:
-                clauses.append(
-                    "(e.scope = 'global' OR (e.scope = 'project' AND e.project_id = ?))"
-                )
+                clauses.append("(e.scope = 'global' OR (e.scope = 'project' AND e.project_id = ?))")
                 params.append(project_id)
-
             params.append(limit)
             sql = f"""
                 SELECT e.*, bm25(events_fts) AS rank
                 FROM events_fts
                 JOIN events e ON e.event_id = events_fts.event_id
                 WHERE {' AND '.join(clauses)}
-                ORDER BY rank, e.created_at DESC
-                LIMIT ?
+                ORDER BY rank, e.created_at DESC LIMIT ?
             """
             rows = conn.execute(sql, params).fetchall()
         elif query:
-            # LIKE fallback if FTS unavailable
             like = f"%{query}%"
-            clauses_like = [
-                "(subject LIKE ? OR summary LIKE ? OR details_json LIKE ?)"
-            ]
+            clauses_like = ["(subject LIKE ? OR summary LIKE ? OR details_json LIKE ?)"]
             params_like: list = [like, like, like]
-
             if event_type:
                 clauses_like.append("event_type = ?")
                 params_like.append(event_type)
-
             if scope == "global":
                 clauses_like.append("scope = 'global'")
             elif scope == "project":
@@ -858,27 +954,17 @@ def memory_read_codex(
                     clauses_like.append("project_id = ?")
                     params_like.append(project_id)
             elif scope == "all" and project_id:
-                clauses_like.append(
-                    "(scope = 'global' OR (scope = 'project' AND project_id = ?))"
-                )
+                clauses_like.append("(scope = 'global' OR (scope = 'project' AND project_id = ?))")
                 params_like.append(project_id)
-
             params_like.append(limit)
-            sql = f"""
-                SELECT * FROM events
-                WHERE {' AND '.join(clauses_like)}
-                ORDER BY created_at DESC LIMIT ?
-            """
+            sql = f"SELECT * FROM events WHERE {' AND '.join(clauses_like)} ORDER BY created_at DESC LIMIT ?"
             rows = conn.execute(sql, params_like).fetchall()
         else:
-            # No query — return recent events
             clauses_recent: list[str] = []
             params_recent: list = []
-
             if event_type:
                 clauses_recent.append("event_type = ?")
                 params_recent.append(event_type)
-
             if scope == "global":
                 clauses_recent.append("scope = 'global'")
             elif scope == "project":
@@ -887,19 +973,14 @@ def memory_read_codex(
                     clauses_recent.append("project_id = ?")
                     params_recent.append(project_id)
             elif scope == "all" and project_id:
-                clauses_recent.append(
-                    "(scope = 'global' OR (scope = 'project' AND project_id = ?))"
-                )
+                clauses_recent.append("(scope = 'global' OR (scope = 'project' AND project_id = ?))")
                 params_recent.append(project_id)
-
             where = f"WHERE {' AND '.join(clauses_recent)}" if clauses_recent else ""
             params_recent.append(limit)
             sql = f"SELECT * FROM events {where} ORDER BY created_at DESC LIMIT ?"
             rows = conn.execute(sql, params_recent).fetchall()
 
         results = [_codex_row_to_dict(r) for r in rows]
-
-        # Total count
         total = conn.execute("SELECT COUNT(*) as cnt FROM events").fetchone()["cnt"]
 
         return {
@@ -918,3 +999,140 @@ def memory_read_codex(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 12: memory_set_enabled (spec §6.2)
+# ---------------------------------------------------------------------------
+
+def memory_set_enabled(enabled: bool) -> dict:
+    """Enable or disable persistent memory writes."""
+    config.memory_enabled = enabled
+    logger.info(f"Memory {'enabled' if enabled else 'disabled'}")
+    return {
+        "memory_enabled": config.memory_enabled,
+        "message": f"Persistent memory {'enabled' if enabled else 'disabled'}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool 13: memory_resume_context (spec §6.3)
+# ---------------------------------------------------------------------------
+
+def memory_resume_context(
+    project_path: str | None = None,
+) -> dict:
+    """Build a continuity payload for fresh-session resume.
+
+    Returns the latest handoff, open loops, project context,
+    recent preferences, recent decisions, and recent unresolved questions.
+    """
+    conn = get_connection()
+    try:
+        project_cond = "project_path IS NULL" if not project_path else "(project_path = ? OR project_path IS NULL)"
+        project_params = [] if not project_path else [project_path]
+
+        # Latest handoff
+        if project_path:
+            handoff = conn.execute(
+                "SELECT * FROM handoffs WHERE project_path = ? ORDER BY created_at DESC LIMIT 1",
+                (project_path,),
+            ).fetchone()
+            if not handoff:
+                handoff = conn.execute(
+                    "SELECT * FROM handoffs WHERE project_path IS NULL ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+        else:
+            handoff = conn.execute(
+                "SELECT * FROM handoffs WHERE project_path IS NULL ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+
+        # Open loops
+        loops = conn.execute(
+            f"SELECT * FROM open_loops WHERE status = 'open' AND {project_cond} "
+            "ORDER BY priority DESC, created_at DESC LIMIT 20",
+            project_params,
+        ).fetchall()
+
+        # Recent preferences
+        prefs = conn.execute(
+            "SELECT * FROM memories WHERE is_archived = 0 AND memory_type = 'preference' "
+            f"AND {project_cond} ORDER BY updated_at DESC LIMIT 10",
+            project_params,
+        ).fetchall()
+
+        # Recent decisions
+        decisions = conn.execute(
+            "SELECT * FROM memories WHERE is_archived = 0 AND memory_type = 'architecture_decision' "
+            f"AND {project_cond} ORDER BY updated_at DESC LIMIT 10",
+            project_params,
+        ).fetchall()
+
+        # Unresolved questions
+        questions = conn.execute(
+            f"SELECT * FROM open_loops WHERE status = 'open' AND loop_type = 'question' AND {project_cond} "
+            "ORDER BY created_at DESC LIMIT 10",
+            project_params,
+        ).fetchall()
+
+        # Recent corrections
+        corrections = conn.execute(
+            "SELECT * FROM memories WHERE is_archived = 0 AND memory_type = 'correction' "
+            f"AND {project_cond} ORDER BY updated_at DESC LIMIT 5",
+            project_params,
+        ).fetchall()
+
+        return {
+            "project_path": project_path,
+            "canonical_available": canonical_available(),
+            "continuity": {
+                "latest_handoff": _row_to_dict(handoff) if handoff else None,
+                "open_loops": _rows_to_list(loops),
+                "preferences": _rows_to_list(prefs),
+                "decisions": _rows_to_list(decisions),
+                "unresolved_questions": _rows_to_list(questions),
+                "recent_corrections": _rows_to_list(corrections),
+            },
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 14: memory_checkpoint (spec §6.9)
+# ---------------------------------------------------------------------------
+
+def memory_checkpoint(
+    session_id: str,
+    task_summary: str,
+    decisions: str = "[]",
+    completed_work: str = "[]",
+    open_loops: str = "[]",
+    next_step: str | None = None,
+    project_path: str | None = None,
+    matter_name: str | None = None,
+) -> dict:
+    """Structured checkpoint — convenience wrapper over memory_write_handoff.
+
+    Captures task summary, decisions, completed work, open loops, and next step.
+    """
+    # Build context notes from completed work and next step
+    completed_list = json.loads(completed_work) if isinstance(completed_work, str) else completed_work
+    context_parts = []
+    if completed_list:
+        context_parts.append("Completed: " + "; ".join(
+            c if isinstance(c, str) else json.dumps(c) for c in completed_list
+        ))
+    if next_step:
+        context_parts.append(f"Next step: {next_step}")
+
+    return memory_write_handoff(
+        session_id=session_id,
+        summary=task_summary,
+        decisions=decisions,
+        open_items=open_loops,
+        next_steps=json.dumps([next_step] if next_step else []),
+        context_notes="; ".join(context_parts) if context_parts else None,
+        project_path=project_path,
+        matter_name=matter_name,
+    )

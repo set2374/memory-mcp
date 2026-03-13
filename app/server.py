@@ -1,4 +1,4 @@
-"""FastMCP server for Memory MCP — local-only persistent memory."""
+"""FastMCP server for Memory MCP — shared canonical event store with local cache."""
 
 import argparse
 import asyncio
@@ -29,9 +29,10 @@ logger.add(
 mcp: FastMCP[Any] = FastMCP(
     name="Memory MCP Server",
     instructions=(
-        "Local-only persistent memory for Claude Code sessions. "
-        "Stores preferences, decisions, corrections, handoffs, and open loops in SQLite. "
-        "No network calls. No secrets. All data stays on this machine."
+        "Shared persistent memory for Claude Code and Codex sessions. "
+        "Canonical event store on OneDrive with local SQLite cache for fast reads. "
+        "Stores preferences, decisions, corrections, handoffs, and open loops. "
+        "Append-only semantics. No secrets. Cross-environment continuity."
     ),
 )
 
@@ -263,6 +264,67 @@ def memory_read_codex(
         limit: Max results (default 20, max 50).
     """
     return tool_funcs.memory_read_codex(query, event_type, scope, project_id, limit)
+
+
+@mcp.tool()
+def memory_set_enabled(enabled: bool) -> dict:
+    """Enable or disable memory writes globally.
+
+    When disabled, all write operations return an error instead of storing data.
+    Read operations continue to work from the local cache.
+
+    Args:
+        enabled: True to enable writes, False to disable.
+    """
+    return tool_funcs.memory_set_enabled(enabled)
+
+
+@mcp.tool()
+def memory_resume_context(
+    project_path: str | None = None,
+) -> dict:
+    """Build a continuity payload for resuming work on a project.
+
+    Returns the latest handoff, open loops, recent preferences, decisions,
+    unresolved questions, and recent corrections — everything needed to
+    resume a session with full context.
+
+    Args:
+        project_path: Project directory path (NULL for global context).
+    """
+    return tool_funcs.memory_resume_context(project_path)
+
+
+@mcp.tool()
+def memory_checkpoint(
+    session_id: str,
+    task_summary: str,
+    decisions: str = "[]",
+    completed_work: str = "[]",
+    open_loops: str = "[]",
+    next_step: str | None = None,
+    project_path: str | None = None,
+    matter_name: str | None = None,
+) -> dict:
+    """Save a mid-session or end-of-session checkpoint.
+
+    Convenience wrapper over memory_write_handoff per spec section 6.9.
+    Creates a handoff event with the current session state.
+
+    Args:
+        session_id: The session creating this checkpoint.
+        task_summary: What was accomplished.
+        decisions: JSON array of decisions made.
+        completed_work: JSON array of completed tasks.
+        open_loops: JSON array of unfinished work / open loops.
+        next_step: Recommended next action.
+        project_path: Scope to a project.
+        matter_name: Optional matter name.
+    """
+    return tool_funcs.memory_checkpoint(
+        session_id, task_summary, decisions, completed_work,
+        open_loops, next_step, project_path, matter_name,
+    )
 
 
 # ---------------------------------------------------------------------------

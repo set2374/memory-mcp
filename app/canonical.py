@@ -42,12 +42,26 @@ def _gen_event_id() -> str:
     return str(uuid.uuid4())
 
 
-def reject_secrets(text: str) -> str | None:
-    """Check text for secret-like material. Returns pattern description if found, else None."""
-    for pat in _SECRET_PATTERNS:
-        m = pat.search(text)
-        if m:
-            return f"Rejected: text contains secret-like material matching pattern near '{m.group()[:20]}...'"
+def reject_secrets(value) -> str | None:
+    """Check value for secret-like material, recursing into dicts and lists.
+
+    Returns pattern description if found, else None.
+    """
+    if isinstance(value, str):
+        for pat in _SECRET_PATTERNS:
+            m = pat.search(value)
+            if m:
+                return f"Rejected: text contains secret-like material matching pattern near '{m.group()[:20]}...'"
+    elif isinstance(value, dict):
+        for v in value.values():
+            result = reject_secrets(v)
+            if result:
+                return result
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            result = reject_secrets(item)
+            if result:
+                return result
     return None
 
 
@@ -346,10 +360,10 @@ def store_event(event: dict) -> dict:
 
     This is the primary write path. All tool writes go through here.
     """
-    # Secret rejection (spec §10)
-    for field in ("summary", "details", "subject"):
+    # Secret rejection (spec §10) — recursive over all payload types
+    for field in ("summary", "details", "subject", "tags"):
         val = event.get(field)
-        if val and isinstance(val, str):
+        if val is not None:
             rejection = reject_secrets(val)
             if rejection:
                 return {"error": rejection, "event_id": event["event_id"]}

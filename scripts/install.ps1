@@ -33,7 +33,7 @@ Write-Host "  Data: $DataDir"
 # 3. Install dependencies
 Write-Host "[3/5] Installing Python dependencies via uv..."
 Push-Location $ServerDir
-uv sync
+uv sync --link-mode=copy
 Pop-Location
 
 # 4. Initialize database

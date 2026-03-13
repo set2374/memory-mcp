@@ -22,7 +22,7 @@ from app.tools import (
 def test_memory_status(temp_db):
     result = memory_status()
     assert result["status"] == "healthy"
-    assert result["version"] == "1.0.0"
+    assert result["version"] == "2.1.0"
     assert result["counts"]["total_memories"] == 0
     assert result["counts"]["open_loops"] == 0
     assert result["last_handoff"] is None

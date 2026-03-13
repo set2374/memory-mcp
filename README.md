@@ -1,16 +1,50 @@
 # Memory MCP Server
 
-Local-only MCP memory server for Claude Code — SQLite-backed persistent memory across sessions.
+Shared-memory MCP server — canonical event store (OneDrive-backed) with local SQLite cache and cross-runtime bridge.
+
+## Architecture
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│ Claude Code  │     │   Cowork    │     │   Codex     │
+│  (stdio)     │     │  (HTTP)     │     │  (bridge)   │
+└──────┬───────┘     └──────┬──────┘     └──────┬──────┘
+       │                    │                    │
+       └────────┬───────────┘                    │
+                │                                │
+        ┌───────▼────────┐               ┌───────▼────────┐
+        │  Memory MCP    │               │  Codex CLI     │
+        │  Server        │               │  (writes own   │
+        │  (this repo)   │               │   cache.sqlite)│
+        └───────┬────────┘               └───────┬────────┘
+                │                                │
+       ┌────────┼─────────┐                      │
+       │        │         │                      │
+ ┌─────▼──┐ ┌──▼───┐ ┌───▼────┐          ┌──────▼──────┐
+ │ SQLite  │ │Canon.│ │Outbox  │          │ cache.sqlite│
+ │ Cache   │ │Store │ │(offline│          │ (Codex)     │
+ │ (.db)   │ │(JSON)│ │writes) │          │             │
+ └─────────┘ └──────┘ └────────┘          └─────────────┘
+```
+
+- **Canonical store** (source of truth): OneDrive-backed JSON event files at `~\OneDrive\.codex\memory\` — shared between Claude and Codex
+- **SQLite cache**: Local `~/.memory-mcp/memory.db` — rebuilt from canonical events, not source of truth
+- **Outbox**: Offline writes queued at `~/.memory-mcp/outbox/` when canonical store is unavailable
+- **Codex bridge**: `memory_read_codex` reads Codex's `cache.sqlite` for cross-runtime memory sharing
 
 ## Features
 
-- **10 MCP tools** for reading, writing, and searching structured memories
-- **SQLite + FTS5** for fast full-text search with ranking
+- **14 MCP tools** for reading, writing, searching, and managing structured memories
+- **Canonical event store** — append-only JSON events synced via OneDrive
+- **SQLite + FTS5** cache for fast full-text search with ranking
 - **Session handoffs** — structured records for cross-session continuity
 - **Open loops** — track unfinished tasks, questions, blockers
 - **Project scoping** — global and per-project memory separation
+- **Secret rejection** — recursive scanning blocks API keys, tokens, passwords
+- **Content-hash deduplication** — SHA-256 prevents aliasing distinct facts
 - **Markdown import** — migrate existing MEMORY.md files
-- **No network calls** — all data stays on your machine
+- **Codex bridge** — read Codex's memory cache for cross-environment sharing
+- **Durable state** — memory_enabled persists across restarts
 - **STDIO + HTTP** — works with Claude Code (stdio) and Cowork (HTTP)
 
 ## Quick Start
@@ -30,7 +64,7 @@ Or manually:
 
 ```bash
 cd ~/memory-mcp
-uv sync
+uv sync --link-mode=copy
 uv run python -c "from app.db import init_db; init_db()"
 ```
 
@@ -87,16 +121,20 @@ uv run --directory C:\Users\set23\memory-mcp python -m app --transport http --po
 
 | Tool | Purpose |
 |------|---------|
-| `memory_status` | Health check, DB stats |
+| `memory_status` | Health check, DB stats, version, canonical availability |
 | `memory_read_recent` | Browse recent memories by type/project |
-| `memory_search` | FTS5 full-text search |
-| `memory_write_fact` | Store a new memory |
-| `memory_write_handoff` | Record session transition |
-| `memory_get_open_loops` | Get pending tasks/questions |
-| `memory_create_loop` | Create a new open loop |
+| `memory_search` | FTS5 full-text search with ranking |
+| `memory_write_fact` | Store a new memory (with content-hash deduplication) |
+| `memory_write_handoff` | Record session transition with decisions, open items, next steps |
+| `memory_get_open_loops` | Get pending tasks/questions/blockers |
+| `memory_create_loop` | Create a new open loop (UUID-based identity) |
 | `memory_close_loop` | Close a loop with resolution |
-| `memory_get_project_context` | Full continuity brief |
-| `memory_import_markdown` | Import from MEMORY.md |
+| `memory_get_project_context` | Full continuity brief for a project |
+| `memory_import_markdown` | Import from MEMORY.md files (idempotent) |
+| `memory_read_codex` | Read Codex's memory cache (cross-runtime bridge) |
+| `memory_set_enabled` | Enable/disable memory (durable across restarts) |
+| `memory_get_enabled` | Check current enabled state |
+| `memory_rebuild_cache` | Rebuild SQLite cache from canonical event store |
 
 ## Memory Types
 
@@ -114,9 +152,12 @@ uv run --directory C:\Users\set23\memory-mcp python -m app --transport http --po
 
 | Path | Content |
 |------|---------|
-| `~/.memory-mcp/memory.db` | SQLite database |
+| `~/.memory-mcp/memory.db` | SQLite cache (local, rebuilt from canonical) |
 | `~/.memory-mcp/logs/` | Server logs |
 | `~/.memory-mcp/backup/` | Daily backups |
+| `~/.memory-mcp/outbox/` | Offline event queue |
+| `~/.memory-mcp/memory_enabled.state` | Durable enabled/disabled state |
+| `~/OneDrive/.codex/memory/` | Canonical event store (shared, source of truth) |
 
 ## Testing
 
@@ -125,13 +166,20 @@ cd ~/memory-mcp
 uv run pytest tests/ -v
 ```
 
-## Architecture
+Tests use full monkeypatch isolation — all 4 modules (`app.config`, `app.db`, `app.tools`, `app.canonical`) are patched to use temp directories, preventing writes to the real canonical store.
 
-- **Framework:** FastMCP (Python)
-- **Storage:** SQLite with WAL mode + FTS5 full-text search
-- **Transport:** stdio (Claude Code) / HTTP (Cowork on port 3097)
-- **Dependencies:** fastmcp, loguru, pydantic, pydantic-settings
-- **No network calls** — purely local I/O
+## Security
+
+- **Secret rejection**: Recursive scanning of all memory content for API keys, tokens, passwords, and secret-like patterns. Blocks writes containing secrets in any field including nested `details` payloads.
+- **Append-only canonical store**: Events are never modified or deleted.
+- **No network calls**: All I/O is local filesystem (OneDrive sync is OS-level, not application-level).
+
+## Dependencies
+
+- [FastMCP](https://github.com/jlowin/fastmcp) >= 2.8.0
+- [Loguru](https://github.com/Delgan/loguru) >= 0.7.3
+- [Pydantic](https://github.com/pydantic/pydantic) >= 2.0.0
+- [Pydantic Settings](https://github.com/pydantic/pydantic-settings) >= 2.0.0
 
 ## License
 

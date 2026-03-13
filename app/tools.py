@@ -4,12 +4,16 @@ Write path: build canonical event → store_event() → also insert into SQLite 
 Read path: read from SQLite cache (populated from canonical events).
 """
 
+import hashlib
 import json
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 
 from loguru import logger
+
+from app import __version__
 
 from app.canonical import (
     build_event,
@@ -98,7 +102,7 @@ def memory_status() -> dict:
 
         return {
             "status": "healthy",
-            "version": "2.0.0",
+            "version": __version__,
             "machine_id": config.machine_id,
             "memory_enabled": config.memory_enabled,
             "canonical_root": str(config.canonical_root),
@@ -170,6 +174,22 @@ def memory_read_recent(
 # Tool 3: memory_search (reads from cache FTS5)
 # ---------------------------------------------------------------------------
 
+def _sanitize_fts5_query(query: str) -> str:
+    """Escape FTS5 special characters so hyphens, UUIDs, etc. search correctly.
+
+    FTS5 interprets bare hyphens as NOT operators. Quote each whitespace-
+    delimited token that contains a hyphen so FTS5 treats it as literal text.
+    """
+    tokens = query.split()
+    safe = []
+    for t in tokens:
+        if "-" in t and not t.startswith('"'):
+            safe.append(f'"{t}"')
+        else:
+            safe.append(t)
+    return " ".join(safe)
+
+
 def memory_search(
     query: str,
     memory_type: str | None = None,
@@ -178,10 +198,11 @@ def memory_search(
     limit: int = 10,
 ) -> dict:
     limit = min(limit, 50)
+    fts_query = _sanitize_fts5_query(query)
     conn = get_connection()
     try:
         conditions = ["m.is_archived = 0"]
-        params: list = [query]
+        params: list = [fts_query]
 
         if memory_type:
             conditions.append("m.memory_type = ?")
@@ -256,8 +277,9 @@ def memory_write_fact(
     project_id = resolve_project_id(project_path)
     scope = "project" if project_path else "global"
 
-    # Build dedupe key from content hash for exact-duplicate prevention
-    dedupe_key = f"{memory_type}:{content[:100]}" if content else None
+    # Build dedupe key from full content hash — prevents exact duplicates
+    # without aliasing distinct facts that share opening text
+    dedupe_key = f"{memory_type}:{hashlib.sha256(content.encode()).hexdigest()}" if content else None
 
     # Build canonical event
     event = build_event(
@@ -309,7 +331,7 @@ def memory_write_fact(
         conn.close()
 
     logger.info(f"Stored memory {new_id} type={memory_type}")
-    return {
+    response = {
         "id": new_id,
         "event_id": new_id,
         "memory_type": memory_type,
@@ -317,6 +339,9 @@ def memory_write_fact(
         "created_at": event["created_at"],
         "canonical": not result.get("_queued", False),
     }
+    if supersedes_id:
+        response["superseded"] = {"id": supersedes_id, "archived": True}
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -404,10 +429,11 @@ def memory_write_handoff(
         # Emit loop_opened events for each open item (spec §6.5)
         for item in open_items_list:
             item_text = item if isinstance(item, str) else json.dumps(item)
+            loop_subject = str(uuid.uuid4())
             loop_event = build_event(
                 event_type="loop_opened",
                 kind="task",
-                subject=item_text[:80],
+                subject=loop_subject,
                 summary=item_text,
                 scope=scope,
                 project_id=project_id,
@@ -425,7 +451,7 @@ def memory_write_handoff(
                     conn,
                     id=loop_event["event_id"],
                     event_id=loop_event["event_id"],
-                    canonical_subject=loop_event.get("subject", item_text[:80]),
+                    canonical_subject=loop_subject,
                     description=item_text,
                     loop_type="task",
                     project_path=project_path,
@@ -520,10 +546,13 @@ def memory_create_loop(
     project_id = resolve_project_id(project_path)
     scope = "project" if project_path else "global"
 
+    # Stable loop identity — UUID, not truncated prose
+    loop_subject = str(uuid.uuid4())
+
     event = build_event(
         event_type="loop_opened",
         kind=loop_type,
-        subject=description[:80],
+        subject=loop_subject,
         summary=description,
         scope=scope,
         project_id=project_id,
@@ -542,7 +571,7 @@ def memory_create_loop(
         return result
 
     new_id = event["event_id"]
-    canonical_subject = event.get("subject", description[:80])
+    canonical_subject = loop_subject
     conn = get_connection()
     try:
         cache_insert_loop(
@@ -1006,12 +1035,13 @@ def memory_read_codex(
 # ---------------------------------------------------------------------------
 
 def memory_set_enabled(enabled: bool) -> dict:
-    """Enable or disable persistent memory writes."""
+    """Enable or disable persistent memory writes. State persists across restarts."""
     config.memory_enabled = enabled
-    logger.info(f"Memory {'enabled' if enabled else 'disabled'}")
+    config.persist_enabled_state()
+    logger.info(f"Memory {'enabled' if enabled else 'disabled'} (persisted)")
     return {
         "memory_enabled": config.memory_enabled,
-        "message": f"Persistent memory {'enabled' if enabled else 'disabled'}",
+        "message": f"Persistent memory {'enabled' if enabled else 'disabled'} (persisted to disk)",
     }
 
 

@@ -35,8 +35,26 @@ class Config(BaseSettings):
     # Local outbox for offline/degraded writes
     outbox_dir: Path = Path.home() / ".memory-mcp" / "outbox"
 
-    # Runtime controls
+    # Runtime controls — loaded from state file if present
     memory_enabled: bool = True
+
+    def _state_file(self) -> "Path":
+        return self.db_path.parent / "memory_enabled.state"
+
+    def load_enabled_state(self) -> None:
+        """Read durable enabled/disabled state from disk."""
+        sf = self._state_file()
+        if sf.exists():
+            try:
+                self.memory_enabled = sf.read_text().strip().lower() == "true"
+            except OSError:
+                pass  # fallback to default
+
+    def persist_enabled_state(self) -> None:
+        """Write enabled/disabled state to disk so it survives restarts."""
+        sf = self._state_file()
+        sf.parent.mkdir(parents=True, exist_ok=True)
+        sf.write_text("true" if self.memory_enabled else "false")
 
     max_backup_days: int = 7
     log_rotation: str = "1 MB"
@@ -50,3 +68,4 @@ class Config(BaseSettings):
 
 
 config = Config()
+config.load_enabled_state()

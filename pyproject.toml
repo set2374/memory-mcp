@@ -1,7 +1,7 @@
 [project]
 name = "memory-mcp-server"
-version = "1.0.0"
-description = "Local-only MCP memory server for Claude Code — SQLite-backed persistent memory across sessions"
+version = "2.1.0"
+description = "Shared-memory MCP server — canonical event store (OneDrive-backed) with local SQLite cache, cross-runtime bridge"
 requires-python = ">=3.12"
 dependencies = [
     "fastmcp>=2.8.0",

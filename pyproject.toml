@@ -1,6 +1,6 @@
 [project]
 name = "memory-mcp-server"
-version = "2.1.0"
+version = "2.2.0"
 description = "Shared-memory MCP server — canonical event store (OneDrive-backed) with local SQLite cache, cross-runtime bridge"
 requires-python = ">=3.12"
 dependencies = [

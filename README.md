@@ -44,6 +44,7 @@ Shared-memory MCP server — canonical event store (OneDrive-backed) with local 
 - **Content-hash deduplication** — SHA-256 prevents aliasing distinct facts
 - **Markdown import** — migrate existing MEMORY.md files
 - **Codex bridge** — read Codex's memory cache for cross-environment sharing
+- **Read-time auto-sync** — stale-detection triggers cache rebuild before reads; fail-soft (never blocks)
 - **Durable state** — memory_enabled persists across restarts
 - **STDIO + HTTP** — works with Claude Code (stdio) and Cowork (HTTP)
 

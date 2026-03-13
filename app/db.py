@@ -7,6 +7,7 @@ canonical events at any time.
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from loguru import logger
@@ -178,6 +179,142 @@ def db_size_kb() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Stale-detection and auto-sync
+# ---------------------------------------------------------------------------
+
+def _newest_canonical_event_mtime() -> float | None:
+    """Return the mtime of the newest canonical event file, or None if empty.
+
+    Walks the canonical event directories and finds the most recently modified
+    .json file. Uses os.scandir for speed — avoids reading file contents.
+    """
+    events_roots = []
+    global_events = config.canonical_root / "global" / "events"
+    if global_events.exists():
+        events_roots.append(global_events)
+    projects_root = config.canonical_root / "projects"
+    if projects_root.exists():
+        for p in projects_root.iterdir():
+            pe = p / "events"
+            if pe.exists():
+                events_roots.append(pe)
+
+    newest = 0.0
+    for root in events_roots:
+        for dirpath, _dirnames, filenames in root.walk():
+            for fn in filenames:
+                if fn.endswith(".json"):
+                    try:
+                        st = (dirpath / fn).stat()
+                        if st.st_mtime > newest:
+                            newest = st.st_mtime
+                    except OSError:
+                        continue
+    return newest if newest > 0 else None
+
+
+def _last_rebuild_timestamp() -> float | None:
+    """Return the last_rebuild timestamp from sync_meta as epoch seconds, or None.
+
+    Prefers the high-precision epoch float stored by the rebuild.
+    Falls back to parsing the ISO string (second precision).
+    """
+    try:
+        conn = get_connection()
+        # Prefer epoch float (sub-second precision)
+        row = conn.execute(
+            "SELECT value FROM sync_meta WHERE key = 'last_rebuild_epoch'"
+        ).fetchone()
+        if row and row["value"]:
+            conn.close()
+            return float(row["value"])
+        # Fallback to ISO string
+        row = conn.execute(
+            "SELECT value FROM sync_meta WHERE key = 'last_rebuild'"
+        ).fetchone()
+        conn.close()
+        if row and row["value"]:
+            dt = datetime.fromisoformat(row["value"].replace("Z", "+00:00"))
+            return dt.timestamp()
+    except Exception:
+        pass
+    return None
+
+
+def cache_freshness() -> dict:
+    """Check whether the cache is stale relative to the canonical store.
+
+    Returns a dict with:
+      - cache_fresh: bool
+      - last_cache_rebuild: str | None (ISO timestamp)
+      - last_canonical_event_mtime: str | None (ISO timestamp)
+      - sync_needed: bool
+    """
+    newest_mtime = _newest_canonical_event_mtime()
+    rebuild_ts = _last_rebuild_timestamp()
+
+    # Convert to ISO strings for display
+    newest_iso = None
+    if newest_mtime:
+        newest_iso = datetime.fromtimestamp(newest_mtime, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    rebuild_iso = None
+    if rebuild_ts:
+        rebuild_iso = datetime.fromtimestamp(rebuild_ts, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    sync_needed = False
+    if newest_mtime is not None:
+        if rebuild_ts is None:
+            sync_needed = True
+        elif newest_mtime > rebuild_ts:
+            sync_needed = True
+
+    return {
+        "cache_fresh": not sync_needed,
+        "last_cache_rebuild": rebuild_iso,
+        "last_canonical_event_mtime": newest_iso,
+        "sync_needed": sync_needed,
+    }
+
+
+def ensure_cache_fresh() -> dict:
+    """If the cache is stale, rebuild from canonical events. Fail-soft.
+
+    Returns a dict with sync result info. On failure, returns cache_fresh=False
+    and the error message — never raises.
+    """
+    try:
+        freshness = cache_freshness()
+        if not freshness["sync_needed"]:
+            return {"synced": False, "reason": "already fresh", **freshness}
+
+        logger.info("Cache stale — rebuilding from canonical events")
+        result = rebuild_cache_from_canonical()
+        if result.get("rebuilt"):
+            return {
+                "synced": True,
+                "events_replayed": result.get("total_events", 0),
+                **cache_freshness(),  # Re-check after rebuild
+            }
+        return {
+            "synced": False,
+            "reason": result.get("reason", "rebuild returned no data"),
+            **freshness,
+        }
+    except Exception as e:
+        logger.error(f"Auto-sync failed: {e}")
+        return {
+            "synced": False,
+            "cache_fresh": False,
+            "sync_error": str(e),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Cache operations — insert canonical events into SQLite cache
 # ---------------------------------------------------------------------------
 
@@ -310,8 +447,16 @@ def rebuild_cache_from_canonical() -> dict:
         counts = {"fact": 0, "handoff": 0, "loop_opened": 0, "loop_closed": 0,
                   "decision_recorded": 0, "project_context_updated": 0}
 
-        # Sort events chronologically for correct supersession
-        events.sort(key=lambda e: e.get("created_at", ""))
+        # Sort events chronologically, with secondary ordering to ensure
+        # creates replay before closes when timestamps are equal
+        _type_order = {
+            "fact": 0, "decision_recorded": 0, "project_context_updated": 0,
+            "handoff": 1, "loop_opened": 2, "loop_closed": 3,
+        }
+        events.sort(key=lambda e: (
+            e.get("created_at", ""),
+            _type_order.get(e.get("event_type"), 0),
+        ))
 
         for event in events:
             etype = event.get("event_type")
@@ -320,11 +465,17 @@ def rebuild_cache_from_canonical() -> dict:
 
         conn.commit()
 
-        # Update sync timestamp
+        # Update sync timestamps — store both ISO (for display) and epoch
+        # float (for precise stale-detection comparison)
         from app.canonical import _now_utc
+        import time
         conn.execute(
             "INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_rebuild', ?)",
             (_now_utc(),),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_meta (key, value) VALUES ('last_rebuild_epoch', ?)",
+            (str(time.time()),),
         )
         conn.commit()
 

@@ -24,10 +24,12 @@ from app.canonical import (
 from app.config import config
 from app.db import (
     cache_close_loop,
+    cache_freshness,
     cache_insert_handoff,
     cache_insert_loop,
     cache_insert_memory,
     db_size_kb,
+    ensure_cache_fresh,
     get_connection,
     rebuild_cache_from_canonical,
 )
@@ -50,6 +52,16 @@ def _row_to_dict(row) -> dict:
 
 def _rows_to_list(rows) -> list[dict]:
     return [dict(r) for r in rows]
+
+
+def _auto_sync() -> dict | None:
+    """Ensure the cache is fresh before serving a read. Fail-soft."""
+    result = ensure_cache_fresh()
+    if result.get("synced"):
+        logger.info(f"Auto-sync: rebuilt cache ({result.get('events_replayed', 0)} events)")
+    if result.get("sync_error"):
+        logger.warning(f"Auto-sync failed: {result['sync_error']}")
+    return result
 
 
 def _memory_type_to_event_type(memory_type: str) -> str:
@@ -100,6 +112,9 @@ def memory_status() -> dict:
         except Exception:
             pass
 
+        # Cache freshness check
+        freshness = cache_freshness()
+
         return {
             "status": "healthy",
             "version": __version__,
@@ -111,6 +126,9 @@ def memory_status() -> dict:
             "cache_db_size_kb": db_size_kb(),
             "outbox_count": outbox_count(),
             "last_cache_rebuild": last_rebuild,
+            "cache_fresh": freshness["cache_fresh"],
+            "last_canonical_event_at": freshness.get("last_canonical_event_mtime"),
+            "sync_needed": freshness["sync_needed"],
             "counts": {
                 "total_memories": total,
                 "by_type": by_type,
@@ -133,6 +151,7 @@ def memory_read_recent(
     limit: int = 20,
     include_archived: bool = False,
 ) -> dict:
+    _auto_sync()
     limit = min(limit, 100)
     conn = get_connection()
     try:
@@ -197,6 +216,7 @@ def memory_search(
     tags: str | None = None,
     limit: int = 10,
 ) -> dict:
+    _auto_sync()
     limit = min(limit, 50)
     fts_query = _sanitize_fts5_query(query)
     conn = get_connection()
@@ -485,6 +505,7 @@ def memory_get_open_loops(
     include_closed: bool = False,
     limit: int = 20,
 ) -> dict:
+    _auto_sync()
     limit = min(limit, 100)
     conn = get_connection()
     try:
@@ -677,6 +698,7 @@ def memory_get_project_context(
     project_path: str,
     include_global: bool = True,
 ) -> dict:
+    _auto_sync()
     conn = get_connection()
     try:
         handoff = conn.execute(
@@ -1057,6 +1079,7 @@ def memory_resume_context(
     Returns the latest handoff, open loops, project context,
     recent preferences, recent decisions, and recent unresolved questions.
     """
+    _auto_sync()
     conn = get_connection()
     try:
         project_cond = "project_path IS NULL" if not project_path else "(project_path = ? OR project_path IS NULL)"
